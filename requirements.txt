@@ -1,0 +1,7 @@
+torch>=2.0
+torch_geometric>=2.5
+numpy
+scipy
+networkx
+scikit-learn
+python-igraph

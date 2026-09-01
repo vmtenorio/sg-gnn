@@ -1,117 +1,33 @@
+"""
+GNN architectures used in the paper.
+
+Naming correspondence between this code and the manuscript:
+  - HeteroGNN / AdaptiveAggGCN implement SG-GNN: HeteroGNN with a fixed,
+    equal-weight combination of graphs is the ablation baseline; AdaptiveAggGCN
+    adds the learned softmax mixing weights alpha_r described in Section V.
+    Setting `per_node >= 0` gives the node-specific variant SG-GNN_N (Section
+    V-A); stacking layers of AdaptiveAggGCN gives the multi-layer variant
+    SG-GNN_L (Section V-B). `orig_layer`/`struc_layer` select the GNN base
+    layer (GCNConv for SG-GCN*, FBGNNLayer for SG-FBGNN*).
+  - FBGNNLayer implements the FBGNN base layer used throughout the paper.
+  - GCN, gfGNN, FAGCN, DirGNN, H2GCN are baseline architectures. The MixHop
+    and SSGC baselines reuse the generic GCN class above with a different
+    per-layer operator plugged in via `gcnlayer` (FBGNNLayer for MixHop,
+    PyG's SSGConv for SSGC); see the experiment scripts for the exact
+    construction.
+"""
+
 import torch
 import torch.nn as nn
 
-import dgl
-import dgl.function as fn
-
-import numpy as np
-import networkx as nx
-
-def node_homophily_pernode(graph, y):
-    # Adapted from https://docs.dgl.ai/en/latest/_modules/dgl/homophily.html#node_homophilyç
-    # Simply removing the mean in the return
-    with graph.local_scope():
-        # Handle the case where graph is of dtype int32.
-        src, dst = graph.edges()
-        src, dst = src.long(), dst.long()
-        # Compute y_v = y_u for all edges.
-        graph.edata["same_class"] = (y[src] == y[dst]).float()
-        graph.update_all(
-            fn.copy_e("same_class", "m"), fn.mean("m", "same_class_deg")
-        )
-        return graph.ndata["same_class_deg"]
-    
-
-def compute_features(A:np.ndarray, ftype:str = "role"):
-    (num_nodes,num_nodes) = A.shape
-    degs = np.sum(A,axis=0)
-    egonet_inds = list(map(lambda i:np.concatenate(([i],np.where(A[i]==1)[0])),np.arange(num_nodes)))
-    egonet = list(map(lambda inds:A[inds][:,inds],egonet_inds))
-
-    G = nx.from_numpy_array(A)
-    G.remove_edges_from(nx.selfloop_edges(G))
-
-    if ftype == "local":
-        raise NotImplementedError
-    elif ftype == "global":
-        f = [None]*7
-        f[0] = list(nx.eccentricity(G).values())
-        f[1] = list(nx.pagerank(G).values())
-        f[2] = list(nx.eigenvector_centrality(G, max_iter=int(1e7)).values())
-        f[3] = list(nx.betweenness_centrality(G).values())
-        f[4] = list(nx.closeness_centrality(G).values())
-        try:
-            f[5] = list(nx.katz_centrality(G).values())
-        except nx.PowerIterationFailedConvergence:
-            f[5] = [1.]*num_nodes
-        f[6] = list(nx.core_number(G).values())
-    elif ftype == "role":
-        f = [None]*7
-        f[0] = degs # Degree
-        f[1] = list(map(np.sum,egonet)) # Within Egonet Degrees
-        f[2] = list(map(lambda inds:np.sum(degs[inds]),egonet_inds)) # Degree sum in egonet
-        f[3] = [f[1][i]/f[2][i] if f[2][i]>0 else 0 for i in range(num_nodes)] # Ratio of within-egonet edges to egonet boundary edges
-        f[4] = [1-f[3][i] if f[2][i]>0 else 0 for i in range(num_nodes)] # Ratio of non-egonet edges to egonet boundary edges
-        f[5] = np.diag(np.linalg.matrix_power(A,3)) # 3-cliques (triangles)
-        f[6] = [2*f[5][i]/(f[0][i]*(f[0][i]-1)) if f[0][i]>1 else 0 for i in range(num_nodes)] # Local Clustering coefficient
-    else:
-        raise NotImplementedError("Select an available feature type")
-        
-    Ft = np.array(f)
-    # scale = np.max(Ft,axis=1)
-    # scale[scale==0] = 1
-    # Ft = Ft/scale[:,None]
-
-    Ah = A + np.eye(num_nodes)
-    Dh = np.diag(degs+1)
-    F = np.concatenate([Ft.T, np.linalg.inv(Dh)@Ah@Ft.T, Ah@Ft.T],axis=1)
-    scale = np.max(F,axis=1)
-    scale[scale==0] = 1
-    F = F/scale[:,None]
-
-    return F
+from torch_geometric.nn import HeteroConv, GCNConv, SGConv, FAConv, Linear, MixHopConv, DirGNNConv
+from torch_geometric.utils import to_torch_sparse_tensor
 
 
-class GCNHLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, S, K):
-        super().__init__()
-
-        self.S = S.clone()
-        self.N = self.S.shape[0]
-        # self.S += torch.eye(self.N, device=self.S.device)
-        self.d = self.S.sum(1)
-        self.d = torch.where(self.d == 0, 1., self.d)
-        self.D_inv = torch.diag(1 / torch.sqrt(self.d))
-        self.S = self.D_inv @ self.S @ self.D_inv
-
-        self.K = K
-        self.Spow = torch.zeros((self.K, self.N, self.N), device=self.S.device)
-        self.Spow[0,:,:] = torch.eye(self.N, device=self.S.device)
-        for k in range(1, self.K):
-            self.Spow[k,:,:] = self.Spow[k-1,:,:] @ self.S
-
-        self.Spow = nn.Parameter(self.Spow, requires_grad=False)
-
-        self.S = nn.Parameter(self.S, requires_grad=False)
-
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        
-        self.W = nn.Parameter(torch.empty(self.K, self.in_dim, self.out_dim))
-        nn.init.kaiming_uniform_(self.W.data)
-
-    def forward(self, _, x): # Graph kept for compatibility
-        assert (self.N, self.in_dim) == x.shape
-        out = torch.zeros((self.N, self.out_dim), device=x.device)
-        for k in range(self.K):
-            out += self.Spow[k,:,:] @ x @ self.W[k,:,:]
-        return out
-
-
-class GCN(nn.Module):
+class GCN(torch.nn.Module):
     def __init__(self, in_dim, hid_dim, out_dim, n_layers, dropout=0.,
                  nonlin=nn.Tanh(), last_act=nn.Softmax(dim=1),
-                 gcnlayer=dgl.nn.GraphConv, gcnlayer_kwargs={}):
+                 gcnlayer=GCNConv, gcnlayer_kwargs={}):
         super().__init__()
 
         self.n_layers = n_layers
@@ -132,65 +48,302 @@ class GCN(nn.Module):
             self.convs.append(self.gcn_layer(in_dim, out_dim, **gcnlayer_kwargs))
 
 
-    def forward(self, graph, x):
+    def forward(self, x, edge_index):
 
         for i in range(self.n_layers - 1):
-            x = self.nonlin(self.convs[i](graph, x))
+            x = self.nonlin(self.convs[i](x=x, edge_index=edge_index))
             x = self.dropout(x)
-        x = self.convs[-1](graph, x)
+        x = self.convs[-1](x=x, edge_index=edge_index)
         x = self.last_act(x)
 
         return x
 
 
-class AdaptiveAggGCN(nn.Module):
-    def __init__(self, in_dim, hid_dim, out_dim, n_graphs=3, dropout=0.,
-                 nonlin=nn.Tanh(), last_act=nn.Softmax(dim=1),
-                 gcnlayer=dgl.nn.GraphConv, gcnlayer_kwargs={}, per_node=-1):
+class FBGNNLayer(torch.nn.Module): # The same as MixHop but adding instead of concatenating
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.out_channels = out_channels
+        self.conv_layer = MixHopConv(in_channels, out_channels, add_self_loops=False)
+
+    def forward(self, x, edge_index):
+        x_out = self.conv_layer(x, edge_index)
+        x_out = x_out.view(x_out.shape[0], -1, self.out_channels) # Second dimension is the number of powers
+        x_out = x_out.sum(1)
+
+        return x_out
+
+class HeteroGNN(torch.nn.Module):
+    def __init__(self, in_dim, hidden_channels, num_classes, num_layers, dropout, nonlin, last_act, graphs, aggr, orig_layer, struc_layer):
+        super().__init__()
+        self.aggr = aggr
+        self.in_dim = in_dim
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+        self.graphs = graphs
+
+        self.nonlin = nonlin
+        self.last_act = last_act
+
+        self.orig_layer = orig_layer
+        self.struc_layer = struc_layer
+
+        if self.aggr == 'cat':
+            self.in_dim_layers = self.hidden_channels*len(self.graphs)
+        else:
+            self.in_dim_layers = self.hidden_channels
+
+        self.build_convs()
+        
+        self.lin = Linear(self.in_dim_layers, num_classes)
+        self.dropout = nn.Dropout(dropout)
+
+    def compute_layer_dict(self, in_dim, out_dim):
+        layer_dict = {}
+        for gname in self.graphs:
+            if 'KNN' in gname or 'EPS' in gname:
+                layer_dict[('web', gname, 'web')] = self.struc_layer(in_dim, out_dim)
+            else:
+                layer_dict[('web', gname, 'web')] = self.orig_layer(in_dim, out_dim)
+        return layer_dict
+
+    def build_convs(self):
+        self.convs = torch.nn.ModuleList()
+
+        self.convs.append(HeteroConv(self.compute_layer_dict(self.in_dim, self.hidden_channels), aggr=self.aggr))
+        for _ in range(self.num_layers-1):
+            self.convs.append(HeteroConv(self.compute_layer_dict(self.in_dim_layers, self.hidden_channels), aggr=self.aggr))
+
+    def forward(self, x_dict, edge_index):
+        for i, conv in enumerate(self.convs):
+            x_dict = conv(x_dict, edge_index)
+            x_dict = {key: self.nonlin(x) for key, x in x_dict.items()}
+            x_dict = {key: self.dropout(x) for key, x in x_dict.items()}
+        return self.last_act(self.lin(x_dict['web']))
+
+class AdaptiveAggGCN(HeteroGNN):
+    def __init__(self, in_dim, hidden_channels, num_classes, num_layers, dropout, nonlin, last_act, graphs, orig_layer, struc_layer, per_node=-1):
+        super().__init__(in_dim, hidden_channels, num_classes, num_layers, dropout, nonlin, last_act, graphs, 'cat', orig_layer, struc_layer)
+
+        if per_node < 0:
+            self.alphas = nn.Parameter(torch.ones(len(graphs)))
+        else:
+            self.alphas = nn.Parameter(torch.ones(len(graphs), per_node))
+
+        self.softmax_alpha = nn.Softmax(dim=0)
+    
+    def build_convs(self):
+        self.conv = HeteroConv(self.compute_layer_dict(self.in_dim, self.hidden_channels), aggr='cat')
+
+    def forward(self, x_dict, edge_index):
+        alphas = self.softmax_alpha(self.alphas)
+
+        x_dict = self.conv(x_dict, edge_index)
+        x_dict = {key: self.nonlin(x) for key, x in x_dict.items()}
+        x_dict = {key: self.dropout(x) for key, x in x_dict.items()}
+
+        x = x_dict['web']
+        if alphas.ndim > 1:
+            x = x*alphas.repeat_interleave(self.hidden_channels, dim=0).T
+        else:
+            x = x*alphas.repeat_interleave(self.hidden_channels)[None,:]
+        
+        return self.last_act(self.lin(x))
+
+class gfGNN(nn.Module):
+    def __init__(self, in_dim, hidden_channels, num_classes, num_layers, dropout, nonlin, last_act, K=3):
         super().__init__()
 
-        self.n_graphs = n_graphs
+        self.in_dim = in_dim
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+
+        self.nonlin = nonlin
+        self.last_act = last_act
+
+        self.sgc = SGConv(self.in_dim, self.hidden_channels, K=K)
+
+        self.dropout = nn.Dropout(dropout)
+
+        lin_modules = [nn.Linear(self.hidden_channels, self.hidden_channels), self.nonlin, self.dropout]*(self.num_layers-2) + \
+            [nn.Linear(self.hidden_channels, num_classes)]
+        self.mlp = nn.Sequential(*lin_modules)
+
+    def forward(self, x, edge_index):
+        h = self.sgc(x, edge_index)
+        h = self.nonlin(h)
+        h = self.dropout(h)
+        return self.last_act(self.mlp(h))
+
+class FAGCN(nn.Module):
+    def __init__(self, in_dim, _, num_classes, num_layers, dropout, nonlin, last_act, K=3):
+        super().__init__()
+
+        self.in_dim = in_dim
+        self.num_layers = num_layers
+
+        self.nonlin = nonlin
+        self.last_act = last_act
+
+        self.lin0 = nn.Linear(self.in_dim, self.in_dim, bias=False)
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.convs = nn.ModuleList()
+
+        if num_layers > 1:
+            self.convs.append(FAConv(self.in_dim))
+            for _ in range(num_layers - 2):
+                self.convs.append(FAConv(self.in_dim))
+            self.convs.append(FAConv(self.in_dim))
+        else:
+            self.convs.append(FAConv(self.in_dim))
+
+        self.linout = nn.Linear(self.in_dim, num_classes)
+
+
+    def forward(self, x, x_0, edge_index):
+        h = self.lin0(x)
+        h = self.nonlin(h)
+        h = self.dropout(h)
+        for i in range(self.num_layers):
+            x = self.nonlin(self.convs[i](x=x, x_0=x_0, edge_index=edge_index))
+            x = self.dropout(x)
+
+        return self.last_act(self.linout(h))
+
+class DirGNN(torch.nn.Module):
+    def __init__(self, in_dim, hidden_channels, num_classes, num_layers, dropout, nonlin, last_act, gcnlayer=GCNConv, K=3):
+        super().__init__()
+
+        self.n_layers = num_layers
+        self.hid_dim = hidden_channels
         self.nonlin = nonlin
         self.last_act = last_act
 
         self.dropout = nn.Dropout(dropout)
-
+        
         self.gcn_layer = gcnlayer
-        if 'S' in gcnlayer_kwargs and type(gcnlayer_kwargs['S']) == list:
-            graphs = gcnlayer_kwargs['S']
-            self.convs = nn.ModuleList()
-            for i in range(n_graphs):
-                gcnlayer_kwargs_i = gcnlayer_kwargs.copy()
-                gcnlayer_kwargs_i['S'] = graphs[i]
-                self.convs.append(self.gcn_layer(in_dim, hid_dim, **gcnlayer_kwargs_i))
+
+        self.convs = nn.ModuleList()
+
+        if self.n_layers > 1:
+            self.convs.append(DirGNNConv(self.gcn_layer(in_dim, self.hid_dim)))
+            for _ in range(self.n_layers - 2):
+                self.convs.append(DirGNNConv(self.gcn_layer(self.hid_dim, self.hid_dim)))
+            self.convs.append(DirGNNConv(self.gcn_layer(self.hid_dim, num_classes)))
         else:
-            self.convs = nn.ModuleList([self.gcn_layer(in_dim, hid_dim, **gcnlayer_kwargs) for _ in range(n_graphs)])
-        self.linear = nn.Linear(hid_dim*n_graphs, out_dim)
-
-        if per_node > 0:
-            self.alphas = nn.Parameter(torch.ones(n_graphs, per_node))
-            self.softmax_alpha = nn.Softmax(dim=0)
-        else:
-            self.alphas = nn.Parameter(torch.ones(n_graphs))
-            self.softmax_alpha = nn.Softmax(dim=0)
+            self.convs.append(DirGNNConv(self.gcn_layer(in_dim, num_classes)))
 
 
-    def forward(self, graphs, x):
+    def forward(self, x, edge_index):
 
-        alphas = self.softmax_alpha(self.alphas)
+        for i in range(self.n_layers - 1):
+            x = self.nonlin(self.convs[i](x=x, edge_index=edge_index))
+            x = self.dropout(x)
+        x = self.convs[-1](x=x, edge_index=edge_index)
+        x = self.last_act(x)
 
-        assert len(graphs) == self.n_graphs
-        xs = []
-        for i in range(self.n_graphs):
-            h = self.convs[i](graphs[i], x.clone())
-            if alphas.ndim > 1:
-                h = alphas[i][:,None] * h
-            else:
-                h = alphas[i]*h
-            h = self.nonlin(h)
-            xs.append(h)
+        return x
 
-        x = torch.cat(xs, 1)
-        x = self.dropout(x)
+class H2GCN(nn.Module):
+    def __init__(
+            self,
+            feat_dim: int,
+            hidden_dim: int,
+            class_dim: int,
+            K: int = 2,
+            dropout: float = 0.5,
+            nonlin: nn.Module = nn.ReLU(),
+            last_act: nn.Module = nn.Identity()
+    ):
+        super(H2GCN, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.k = K
+        self.act = nonlin
+        self.last_act = last_act
+        self.w_embed = nn.Parameter(
+            torch.zeros(size=(feat_dim, hidden_dim)),
+            requires_grad=True
+        )
+        self.w_classify = nn.Parameter(
+            torch.zeros(size=((2 ** (self.k + 1) - 1) * hidden_dim, class_dim)),
+            requires_grad=True
+        )
+        self.params = [self.w_embed, self.w_classify]
+        self.initialized = False
+        self.a1 = None
+        self.a2 = None
+        self.reset_parameter()
 
-        return self.linear(x)
+    def reset_parameter(self):
+        nn.init.xavier_uniform_(self.w_embed)
+        nn.init.xavier_uniform_(self.w_classify)
+
+    @staticmethod
+    def _indicator(sp_tensor: torch.sparse.Tensor) -> torch.sparse.Tensor:
+        csp = sp_tensor.coalesce()
+        return torch.sparse_coo_tensor(
+            indices=csp.indices(),
+            values=torch.where(csp.values() > 0, 1, 0),
+            size=csp.size(),
+            dtype=torch.float
+        )
+
+    @staticmethod
+    def _spspmm(sp1: torch.sparse.Tensor, sp2: torch.sparse.Tensor) -> torch.sparse.Tensor:
+        assert sp1.shape[1] == sp2.shape[0], 'Cannot multiply size %s with %s' % (sp1.shape, sp2.shape)
+        sp1, sp2 = sp1.coalesce(), sp2.coalesce()
+        m, n, k = sp1.shape[0], sp1.shape[1], sp2.shape[1]
+        prod = (sp1 @ sp2).coalesce()
+        indices, values = prod.indices(), prod.values()
+        return torch.sparse_coo_tensor(
+            indices=indices,
+            values=values,
+            size=(m, k),
+            dtype=torch.float
+        )
+
+    @classmethod
+    def _adj_norm(cls, adj: torch.sparse.Tensor) -> torch.sparse.Tensor:
+        n = adj.size(0)
+        d_diag = torch.pow(torch.sparse.sum(adj, dim=1).values(), -0.5)
+        d_diag = torch.where(torch.isinf(d_diag), torch.full_like(d_diag, 0), d_diag)
+        d_tiled = torch.sparse_coo_tensor(
+            indices=[list(range(n)), list(range(n))],
+            values=d_diag,
+            size=(n, n)
+        )
+        return cls._spspmm(cls._spspmm(d_tiled, adj), d_tiled)
+
+    def _prepare_prop(self, adj):
+        n = adj.size(0)
+        device = adj.device
+        self.initialized = True
+        sp_eye = torch.sparse_coo_tensor(
+            indices=[list(range(n)), list(range(n))],
+            values=[1.0] * n,
+            size=(n, n),
+            dtype=torch.float
+        ).to(device)
+        # initialize A1, A2
+        a1 = self._indicator(adj - sp_eye)
+        a2 = self._indicator(self._spspmm(adj, adj) - adj - sp_eye)
+        # norm A1 A2
+        self.a1 = self._adj_norm(a1)
+        self.a2 = self._adj_norm(a2)
+
+    def forward(self, x: torch.FloatTensor, edge_index: torch.Tensor) -> torch.FloatTensor:
+        adj = to_torch_sparse_tensor(edge_index)
+        if not self.initialized:
+            self._prepare_prop(adj)
+        # H2GCN propagation
+        rs = [self.act(torch.mm(x, self.w_embed))]
+        for i in range(self.k):
+            r_last = rs[-1]
+            r1 = torch.spmm(self.a1, r_last)
+            r2 = torch.spmm(self.a2, r_last)
+            rs.append(self.act(torch.cat([r1, r2], dim=1)))
+        r_final = torch.cat(rs, dim=1)
+        r_final = self.dropout(r_final)
+        return self.last_act(torch.mm(r_final, self.w_classify))
+    
