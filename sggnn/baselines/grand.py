@@ -11,21 +11,18 @@ Design:
   Closed-form Euler discretisation over K steps:
       X(t+dt) = X(t) + dt * alpha * (A_hat X(t) - X(t))
   alpha is a learnable scalar (sigmoid-activated so it stays in (0,1)).
-  If torchdiffeq is installed it is used as the ODE solver; otherwise Euler.
 
 Interface (matches all other wrappers in this project):
   GRANDWrapper(in_dim, hid_dim, out_dim, num_layers, dropout, nonlin, last_act, **kwargs)
-  forward(x, edge_index) -> [N, out_dim] logits
+  forward(x, edge_index) -> [N, out_dim] last_act(logits)
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
-from torch_geometric.utils import get_laplacian, add_self_loops, degree
+from torch_geometric.utils import add_self_loops, degree
 
 
-def _sym_norm_adj_x(x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+def sym_norm_agg(x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
     """One step of symmetric-normalised adjacency message passing: A_hat @ X."""
     N = x.size(0)
     # Add self-loops then normalise: D^{-1/2} A D^{-1/2}
@@ -74,17 +71,14 @@ class GRANDWrapper(nn.Module):
         self.nonlin = nonlin if nonlin is not None else nn.ReLU()
         self.last_act = last_act if last_act is not None else nn.Softmax(dim=1)
 
-        # Encoder: project raw features into diffusion space
         self.encoder = nn.Linear(in_dim, hid_dim)
 
         # Learnable diffusion time and alpha scalar
         self.log_t = nn.Parameter(torch.tensor(float(t_init)).log())
         self.alpha_logit = nn.Parameter(torch.zeros(1))  # sigmoid -> (0,1)
 
-        # Decoder
         self.decoder = nn.Linear(hid_dim, out_dim)
 
-    # ------------------------------------------------------------------
     def _diffuse(self, x0: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """Euler discretisation of dX/dt = alpha*(A_hat X - X) for K steps."""
         t = self.log_t.exp()          # total time  > 0
@@ -93,16 +87,12 @@ class GRANDWrapper(nn.Module):
 
         x = x0
         for _ in range(self.K):
-            ax = _sym_norm_adj_x(x, edge_index)
+            ax = sym_norm_agg(x, edge_index)
             x = x + dt * alpha * (ax - x)
         return x
 
-    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        # Encode
         h = self.nonlin(self.encoder(self.dropout(x)))
-        # Diffuse
         h = self._diffuse(h, edge_index)
-        # Decode
         out = self.decoder(self.dropout(h))
         return self.last_act(out)

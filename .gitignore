@@ -18,6 +18,11 @@ logs/
 .datapyg/
 data/
 
+# Large candidate-graph cache: distributed as a GitHub Release asset instead
+# (see README's "Graph cache" section), not committed to git.
+node_embeddings/embedding_graphs.npz
+node_embeddings/*.pkl
+
 # Editor / OS
 .vscode/
 .DS_Store

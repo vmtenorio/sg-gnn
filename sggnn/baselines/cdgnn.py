@@ -17,27 +17,14 @@ Design (from function_laplacian_convection.py):
 
 Interface:
   CDGNNWrapper(in_dim, hid_dim, out_dim, num_layers, dropout, nonlin, last_act, **kwargs)
-  forward(x, edge_index) -> [N, out_dim] logits
+  forward(x, edge_index) -> [N, out_dim] last_act(logits)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.utils import add_self_loops, degree
 
-
-def _sym_agg(x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-    """A_sym @ x  (with self-loops, symmetric normalisation)."""
-    N = x.size(0)
-    ei, _ = add_self_loops(edge_index, num_nodes=N)
-    row, col = ei
-    deg = degree(col, N, dtype=x.dtype)
-    d_inv_sqrt = deg.pow(-0.5)
-    d_inv_sqrt[d_inv_sqrt == float("inf")] = 0.0
-    norm = d_inv_sqrt[row] * d_inv_sqrt[col]
-    out = torch.zeros_like(x)
-    out.scatter_add_(0, col.unsqueeze(-1).expand_as(x[row]), norm.unsqueeze(-1) * x[row])
-    return out
+from .grand import sym_norm_agg
 
 
 class CDGNNWrapper(nn.Module):
@@ -96,17 +83,15 @@ class CDGNNWrapper(nn.Module):
         self.bn_diff = nn.BatchNorm1d(hid_dim)
         self.bn_conv = nn.BatchNorm1d(hid_dim)
 
-    # ------------------------------------------------------------------
     def _step(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """One ODE step: diffusion + convection contribution."""
         N = x.size(0)
         row, col = edge_index  # src, dst
 
-        # --- Diffusion branch: A_sym @ x  (already excludes self-loops here;
-        #     _sym_agg adds them internally)
-        diff = _sym_agg(x, edge_index)           # [N, H]
+        # Diffusion branch: A_sym @ x, with self-loops added by sym_norm_agg
+        diff = sym_norm_agg(x, edge_index)       # [N, H]
 
-        # --- Convection branch -----------------------------------------
+        # Convection branch
         xi = x[row]                               # [E, H]  source features
         xj = x[col]                               # [E, H]  dest features
         # Gate (attention scalar per edge)
@@ -125,7 +110,6 @@ class CDGNNWrapper(nn.Module):
 
         return mixed  # f(x) before alpha * (f - x)
 
-    # ------------------------------------------------------------------
     def _diffuse(self, x0: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         t = self.log_t.exp()
         dt = t / self.K
@@ -137,7 +121,6 @@ class CDGNNWrapper(nn.Module):
             x = x + dt * alpha * (fx - x)
         return x
 
-    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         h = self.nonlin(self.encoder(self.dropout(x)))
         h = self._diffuse(h, edge_index)

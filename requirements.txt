@@ -1,7 +1,20 @@
-torch>=2.0
-torch_geometric>=2.5
-numpy
-scipy
-networkx
-scikit-learn
-python-igraph
+# Install PyTorch and PyTorch Geometric separately, matching your CUDA
+# version -- see https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html.
+# Versions below are what the paper's experiments were run with (torch 2.10.0+cu128):
+#   torch==2.10.0
+#   torch_geometric==2.8.0.post1
+#   torch-scatter==2.1.2   (optional; torch_geometric works without it, with a warning)
+#   torch-sparse==0.6.18   (optional; torch_geometric works without it, with a warning)
+numpy==1.26.4
+scipy==1.11.4
+networkx==3.4.2
+scikit-learn==1.8.0
+pandas==2.1.4
+
+# Optional, only for building the candidate-graph cache from scratch
+# (python main.py build-graphs): DeepWalk/Node2Vec/Struc2Vec graphs need
+# GraphEmbedding (https://github.com/shenweichen/GraphEmbedding), and
+# GraphWave graphs need a graphwave implementation exposing
+# `graphwave.graphwave.graphwave_alg` (Donnat et al., KDD 2018). Neither is
+# vendored or patched here -- install them separately if you need those
+# columns; Role/Global/Feat graphs need nothing beyond this file.

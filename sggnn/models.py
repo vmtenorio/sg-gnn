@@ -1,22 +1,3 @@
-"""
-GNN architectures used in the paper.
-
-Naming correspondence between this code and the manuscript:
-  - HeteroGNN / AdaptiveAggGCN implement SG-GNN: HeteroGNN with a fixed,
-    equal-weight combination of graphs is the ablation baseline; AdaptiveAggGCN
-    adds the learned softmax mixing weights alpha_r described in Section V.
-    Setting `per_node >= 0` gives the node-specific variant SG-GNN_N (Section
-    V-A); stacking layers of AdaptiveAggGCN gives the multi-layer variant
-    SG-GNN_L (Section V-B). `orig_layer`/`struc_layer` select the GNN base
-    layer (GCNConv for SG-GCN*, FBGNNLayer for SG-FBGNN*).
-  - FBGNNLayer implements the FBGNN base layer used throughout the paper.
-  - GCN, gfGNN, FAGCN, DirGNN, H2GCN are baseline architectures. The MixHop
-    and SSGC baselines reuse the generic GCN class above with a different
-    per-layer operator plugged in via `gcnlayer` (FBGNNLayer for MixHop,
-    PyG's SSGConv for SSGC); see the experiment scripts for the exact
-    construction.
-"""
-
 import torch
 import torch.nn as nn
 
@@ -175,44 +156,47 @@ class gfGNN(nn.Module):
         return self.last_act(self.mlp(h))
 
 class FAGCN(nn.Module):
-    def __init__(self, in_dim, _, num_classes, num_layers, dropout, nonlin, last_act, K=3):
+    """Follows the official FAGCN (bdy9527/FAGCN, src/model.py):
+        h = dropout(x); h = relu_or_nonlin(t1(h)); h = dropout(h); raw = h
+        for each layer: h = FAConv(h, raw, edge_index)   # FAConv already adds eps*raw internally
+        return t2(h)
+    t1: in_dim -> hidden_dim, t2: hidden_dim -> num_classes. Propagation runs at `hidden_dim`
+    width, so parameter matching scales hidden_dim like every other baseline. The activation
+    after t1 is the shared `nonlin` (the official repo uses ReLU). `eps` defaults to the
+    official repo's 0.3 (PyG's FAConv default is 0.1)."""
+
+    def __init__(self, in_dim, hidden_dim, num_classes, num_layers, dropout, nonlin, last_act,
+                 eps=0.3):
         super().__init__()
 
-        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
         self.nonlin = nonlin
         self.last_act = last_act
 
-        self.lin0 = nn.Linear(self.in_dim, self.in_dim, bias=False)
+        self.lin0 = nn.Linear(in_dim, hidden_dim, bias=False)  # t1
 
         self.dropout = nn.Dropout(dropout)
 
-        self.convs = nn.ModuleList()
+        self.convs = nn.ModuleList([
+            FAConv(hidden_dim, eps=eps, dropout=dropout) for _ in range(num_layers)
+        ])
 
-        if num_layers > 1:
-            self.convs.append(FAConv(self.in_dim))
-            for _ in range(num_layers - 2):
-                self.convs.append(FAConv(self.in_dim))
-            self.convs.append(FAConv(self.in_dim))
-        else:
-            self.convs.append(FAConv(self.in_dim))
-
-        self.linout = nn.Linear(self.in_dim, num_classes)
-
+        self.linout = nn.Linear(hidden_dim, num_classes)  # t2
 
     def forward(self, x, x_0, edge_index):
-        h = self.lin0(x)
-        h = self.nonlin(h)
+        h = self.dropout(x)
+        h = self.nonlin(self.lin0(h))
         h = self.dropout(h)
-        for i in range(self.num_layers):
-            x = self.nonlin(self.convs[i](x=x, x_0=x_0, edge_index=edge_index))
-            x = self.dropout(x)
+        raw = h
+        for conv in self.convs:
+            h = conv(x=h, x_0=raw, edge_index=edge_index)
 
         return self.last_act(self.linout(h))
 
 class DirGNN(torch.nn.Module):
-    def __init__(self, in_dim, hidden_channels, num_classes, num_layers, dropout, nonlin, last_act, gcnlayer=GCNConv, K=3):
+    def __init__(self, in_dim, hidden_channels, num_classes, num_layers, dropout, nonlin, last_act, gcnlayer=GCNConv):
         super().__init__()
 
         self.n_layers = num_layers
@@ -269,7 +253,6 @@ class H2GCN(nn.Module):
             torch.zeros(size=((2 ** (self.k + 1) - 1) * hidden_dim, class_dim)),
             requires_grad=True
         )
-        self.params = [self.w_embed, self.w_classify]
         self.initialized = False
         self.a1 = None
         self.a2 = None
@@ -293,7 +276,7 @@ class H2GCN(nn.Module):
     def _spspmm(sp1: torch.sparse.Tensor, sp2: torch.sparse.Tensor) -> torch.sparse.Tensor:
         assert sp1.shape[1] == sp2.shape[0], 'Cannot multiply size %s with %s' % (sp1.shape, sp2.shape)
         sp1, sp2 = sp1.coalesce(), sp2.coalesce()
-        m, n, k = sp1.shape[0], sp1.shape[1], sp2.shape[1]
+        m, k = sp1.shape[0], sp2.shape[1]
         prod = (sp1 @ sp2).coalesce()
         indices, values = prod.indices(), prod.values()
         return torch.sparse_coo_tensor(
@@ -325,10 +308,8 @@ class H2GCN(nn.Module):
             size=(n, n),
             dtype=torch.float
         ).to(device)
-        # initialize A1, A2
         a1 = self._indicator(adj - sp_eye)
         a2 = self._indicator(self._spspmm(adj, adj) - adj - sp_eye)
-        # norm A1 A2
         self.a1 = self._adj_norm(a1)
         self.a2 = self._adj_norm(a2)
 
@@ -336,7 +317,6 @@ class H2GCN(nn.Module):
         adj = to_torch_sparse_tensor(edge_index)
         if not self.initialized:
             self._prepare_prop(adj)
-        # H2GCN propagation
         rs = [self.act(torch.mm(x, self.w_embed))]
         for i in range(self.k):
             r_last = rs[-1]
@@ -346,4 +326,3 @@ class H2GCN(nn.Module):
         r_final = torch.cat(rs, dim=1)
         r_final = self.dropout(r_final)
         return self.last_act(torch.mm(r_final, self.w_classify))
-    

@@ -1,0 +1,3 @@
+Placeholder so this directory exists after cloning. `embedding_graphs.npz`
+(built by `python main.py build-graphs`, or downloaded from this repo's
+GitHub Releases) goes here; it is git-ignored, not committed.
